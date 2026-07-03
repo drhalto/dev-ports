@@ -253,11 +253,11 @@ $xaml = @'
   </Window.Resources>
   <DockPanel Margin="12">
     <DockPanel DockPanel.Dock="Top" Margin="0,0,0,10">
-      <Button x:Name="BtnStop" DockPanel.Dock="Right" Background="#5B3344" Content="■  Stop"/>
+      <Button x:Name="BtnStop" DockPanel.Dock="Right" Background="#5B3344" Content="&#x25A0;  Stop"/>
       <Button x:Name="BtnCopy" DockPanel.Dock="Right" Content="Copy URL"/>
       <Button x:Name="BtnBrowse" DockPanel.Dock="Right" Content="Open in Browser"/>
       <Button x:Name="BtnFolder" DockPanel.Dock="Right" Content="Open Folder"/>
-      <Button x:Name="BtnRefresh" DockPanel.Dock="Right" Content="↻  Refresh"/>
+      <Button x:Name="BtnRefresh" DockPanel.Dock="Right" Content="&#x21BB;  Refresh"/>
       <CheckBox x:Name="ChkSystem" DockPanel.Dock="Right" Content="System" Foreground="#8087A2"
                 VerticalAlignment="Center" Margin="12,0,6,0"/>
       <TextBox x:Name="TxtFilter" Background="#24273A" Foreground="#CAD3F5" BorderThickness="0"
