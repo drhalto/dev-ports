@@ -22,94 +22,152 @@ public class PortApp {
 '@
 } catch { } # type already loaded on re-run
 
-$SystemNames = @('system','idle','svchost.exe','lsass.exe','services.exe','wininit.exe',
-    'winlogon.exe','csrss.exe','spoolsv.exe','dns.exe','searchhost.exe','memory compression')
-$RunnerNames = @('node.exe','cmd.exe','powershell.exe','pwsh.exe','bun.exe','deno.exe','python.exe','dotnet.exe')
-$RunnerCmdHint = 'npm|pnpm|yarn|bun|vite|next|turbo|nodemon|webpack|astro|remix|nuxt|ng serve|dotnet watch|uvicorn|flask|manage\.py'
-$NeverKillRoot = @('explorer.exe','windowsterminal.exe','wt.exe','conhost.exe','openconsole.exe',
-    'code.exe','cursor.exe','devenv.exe','services.exe','svchost.exe','wininit.exe','userinit.exe')
+try {
+    # Raw iphlpapi listener table - milliseconds, vs ~7s for Get-NetTCPConnection's
+    # first call in a fresh runspace (CDXML module import + CIM warm-up).
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
 
-function Get-ProjectDir([string]$cmdline, [string]$exePath) {
-    if (-not $cmdline) { $cmdline = '' }
-    $candidates = [System.Collections.Generic.List[string]]::new()
-    foreach ($m in [regex]::Matches($cmdline, '"([A-Za-z]:\\[^"]+)"|([A-Za-z]:\\[^\s"]+)')) {
-        $v = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }
-        $candidates.Add($v)
-    }
-    foreach ($c in $candidates) {
-        $i = $c.IndexOf('\node_modules\', [System.StringComparison]::OrdinalIgnoreCase)
-        if ($i -gt 0) { return $c.Substring(0, $i) }
-    }
-    $home_ = $env:USERPROFILE
-    foreach ($c in $candidates) {
-        if ($c.StartsWith($home_, [System.StringComparison]::OrdinalIgnoreCase) -and
-            $c -notmatch '\\AppData\\|\\node_modules$|\.exe"?$') {
-            if (Test-Path -LiteralPath $c -PathType Container) { return $c }
-            $d = Split-Path $c -Parent
-            if ($d -and $d -ne $home_) { return $d }
+public static class DevPortsNative {
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int dwOutBufLen, bool sort, int ipVersion, int tableClass, uint reserved);
+
+    public struct Listener { public int Port; public int Pid; }
+
+    // tableClass 3 = TCP_TABLE_OWNER_PID_LISTENER
+    static void Collect(int family, List<Listener> results) {
+        int size = 0;
+        GetExtendedTcpTable(IntPtr.Zero, ref size, false, family, 3, 0);
+        for (int attempt = 0; attempt < 3; attempt++) {
+            IntPtr buf = Marshal.AllocHGlobal(size);
+            try {
+                uint rc = GetExtendedTcpTable(buf, ref size, false, family, 3, 0);
+                if (rc == 122) continue;      // ERROR_INSUFFICIENT_BUFFER: table grew, retry
+                if (rc != 0) return;
+                int count = Marshal.ReadInt32(buf);
+                // MIB_TCPROW_OWNER_PID (v4) vs MIB_TCP6ROW_OWNER_PID (v6) layouts
+                int rowSize    = (family == 2) ? 24 : 56;
+                int portOffset = (family == 2) ? 8  : 20;
+                int pidOffset  = (family == 2) ? 20 : 52;
+                IntPtr row = (IntPtr)((long)buf + 4);
+                for (int i = 0; i < count; i++) {
+                    int portRaw = Marshal.ReadInt32(row, portOffset);
+                    results.Add(new Listener {
+                        Port = ((portRaw & 0xFF) << 8) | ((portRaw >> 8) & 0xFF),
+                        Pid = Marshal.ReadInt32(row, pidOffset)
+                    });
+                    row = (IntPtr)((long)row + rowSize);
+                }
+                return;
+            } finally { Marshal.FreeHGlobal(buf); }
         }
     }
-    return ''
-}
 
-function Get-KillRoot([int]$procId, [hashtable]$procs, [string]$projectDir) {
-    $current = $procId
-    for ($depth = 0; $depth -lt 8; $depth++) {
-        $p = $procs[$current]
-        if (-not $p) { break }
-        $parentId = [int]$p.ParentProcessId
-        if ($parentId -le 4 -or -not $procs.ContainsKey($parentId)) { break }
-        $parent = $procs[$parentId]
-        $pname = ('' + $parent.Name).ToLower()
-        if ($NeverKillRoot -contains $pname) { break }
-        $pcmd = '' + $parent.CommandLine
-        $sameProject = $projectDir -and $pcmd -and
-            $pcmd.IndexOf($projectDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
-        $isRunner = ($RunnerNames -contains $pname) -and ($pcmd -match $RunnerCmdHint)
-        if ($sameProject -or $isRunner) { $current = $parentId } else { break }
+    public static List<Listener> GetListeners() {
+        var list = new List<Listener>();
+        Collect(2, list);   // AF_INET
+        Collect(23, list);  // AF_INET6
+        return list;
     }
-    return $current
 }
+'@
+} catch { } # type already loaded on re-run
 
-function Get-DockerPortMap {
-    $map = @{}
-    if (-not (Get-Process 'com.docker.backend' -ErrorAction SilentlyContinue)) { return $map }
-    try {
-        $lines = & docker ps --format '{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}' 2>$null
-        foreach ($line in @($lines)) {
-            $parts = $line -split '\|', 4
-            if ($parts.Count -lt 4) { continue }
-            $up = ($parts[2] -replace '^Up\s+', '' -replace '\s*\(.*\)$', '')
-            foreach ($m in [regex]::Matches($parts[3], ':(\d+)->')) {
-                $map[[int]$m.Groups[1].Value] = @{ Name = $parts[0]; Image = $parts[1]; Up = $up }
+# The entire scan lives in one scriptblock so the GUI can run it in a background
+# runspace (the UI thread never blocks) and -Smoke can run the same code inline.
+$ScanScript = {
+    $ErrorActionPreference = 'Continue'
+
+    $SystemNames = @('system','idle','svchost.exe','lsass.exe','services.exe','wininit.exe',
+        'winlogon.exe','csrss.exe','spoolsv.exe','dns.exe','searchhost.exe','memory compression')
+    $RunnerNames = @('node.exe','cmd.exe','powershell.exe','pwsh.exe','bun.exe','deno.exe','python.exe','dotnet.exe')
+    $RunnerCmdHint = 'npm|pnpm|yarn|bun|vite|next|turbo|nodemon|webpack|astro|remix|nuxt|ng serve|dotnet watch|uvicorn|flask|manage\.py'
+    $NeverKillRoot = @('explorer.exe','windowsterminal.exe','wt.exe','conhost.exe','openconsole.exe',
+        'code.exe','cursor.exe','devenv.exe','services.exe','svchost.exe','wininit.exe','userinit.exe')
+
+    function Get-ProjectDir([string]$cmdline, [string]$exePath) {
+        if (-not $cmdline) { $cmdline = '' }
+        $candidates = [System.Collections.Generic.List[string]]::new()
+        foreach ($m in [regex]::Matches($cmdline, '"([A-Za-z]:\\[^"]+)"|([A-Za-z]:\\[^\s"]+)')) {
+            $v = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }
+            $candidates.Add($v)
+        }
+        foreach ($c in $candidates) {
+            $i = $c.IndexOf('\node_modules\', [System.StringComparison]::OrdinalIgnoreCase)
+            if ($i -gt 0) { return $c.Substring(0, $i) }
+        }
+        $home_ = $env:USERPROFILE
+        foreach ($c in $candidates) {
+            if ($c.StartsWith($home_, [System.StringComparison]::OrdinalIgnoreCase) -and
+                $c -notmatch '\\AppData\\|\\node_modules$|\.exe"?$') {
+                if (Test-Path -LiteralPath $c -PathType Container) { return $c }
+                $d = Split-Path $c -Parent
+                if ($d -and $d -ne $home_) { return $d }
             }
         }
-    } catch { }
-    return $map
-}
+        return ''
+    }
 
-function Format-Uptime([datetime]$start) {
-    $ts = (Get-Date) - $start
-    if ($ts.TotalDays -ge 1) { return ('{0}d {1}h' -f [int]$ts.TotalDays, $ts.Hours) }
-    if ($ts.TotalHours -ge 1) { return ('{0}h {1}m' -f $ts.Hours, $ts.Minutes) }
-    return ('{0}m' -f [math]::Max(1, [int]$ts.TotalMinutes))
-}
+    function Get-KillRoot([int]$procId, [hashtable]$procs, [string]$projectDir) {
+        $current = $procId
+        for ($depth = 0; $depth -lt 8; $depth++) {
+            $p = $procs[$current]
+            if (-not $p) { break }
+            $parentId = [int]$p.ParentProcessId
+            if ($parentId -le 4 -or -not $procs.ContainsKey($parentId)) { break }
+            $parent = $procs[$parentId]
+            $pname = ('' + $parent.Name).ToLower()
+            if ($NeverKillRoot -contains $pname) { break }
+            $pcmd = '' + $parent.CommandLine
+            $sameProject = $projectDir -and $pcmd -and
+                $pcmd.IndexOf($projectDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+            $isRunner = ($RunnerNames -contains $pname) -and ($pcmd -match $RunnerCmdHint)
+            if ($sameProject -or $isRunner) { $current = $parentId } else { break }
+        }
+        return $current
+    }
 
-function Format-Mem([long]$bytes) {
-    if ($bytes -ge 1GB) { return ('{0:n1} GB' -f ($bytes / 1GB)) }
-    return ('{0:n0} MB' -f ($bytes / 1MB))
-}
+    function Get-DockerPortMap {
+        $map = @{}
+        if (-not (Get-Process 'com.docker.backend' -ErrorAction SilentlyContinue)) { return $map }
+        try {
+            $lines = & docker ps --format '{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}' 2>$null
+            foreach ($line in @($lines)) {
+                $parts = $line -split '\|', 4
+                if ($parts.Count -lt 4) { continue }
+                $up = ($parts[2] -replace '^Up\s+', '' -replace '\s*\(.*\)$', '')
+                foreach ($m in [regex]::Matches($parts[3], ':(\d+)->')) {
+                    $map[[int]$m.Groups[1].Value] = @{ Name = $parts[0]; Image = $parts[1]; Up = $up }
+                }
+            }
+        } catch { }
+        return $map
+    }
 
-function Get-Scan {
+    function Format-Uptime([datetime]$start) {
+        $ts = (Get-Date) - $start
+        if ($ts.TotalDays -ge 1) { return ('{0}d {1}h' -f [int]$ts.TotalDays, $ts.Hours) }
+        if ($ts.TotalHours -ge 1) { return ('{0}h {1}m' -f $ts.Hours, $ts.Minutes) }
+        return ('{0}m' -f [math]::Max(1, [int]$ts.TotalMinutes))
+    }
+
+    function Format-Mem([long]$bytes) {
+        if ($bytes -ge 1GB) { return ('{0:n1} GB' -f ($bytes / 1GB)) }
+        return ('{0:n0} MB' -f ($bytes / 1MB))
+    }
+
     $procs = @{}
-    foreach ($p in (Get-CimInstance Win32_Process)) { $procs[[int]$p.ProcessId] = $p }
+    $cimProps = 'ProcessId','ParentProcessId','Name','CommandLine','ExecutablePath','WorkingSetSize','CreationDate'
+    foreach ($p in (Get-CimInstance Win32_Process -Property $cimProps)) { $procs[[int]$p.ProcessId] = $p }
     $dockerMap = Get-DockerPortMap
 
     $seen = @{}
     $groups = @{}
-    foreach ($c in (Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue)) {
-        $port = [int]$c.LocalPort
-        $ownerPid = [int]$c.OwningProcess
+    foreach ($c in [DevPortsNative]::GetListeners()) {
+        $port = [int]$c.Port
+        $ownerPid = [int]$c.Pid
         $dedup = "$port-$ownerPid"
         if ($seen.ContainsKey($dedup)) { continue }
         $seen[$dedup] = $true
@@ -168,12 +226,12 @@ function Get-Scan {
             FirstPort = $portList[0]; SortKey = $kindOrder[$g.Kind]
         }
     }
-    return @($rows | Sort-Object SortKey, FirstPort)
+    @($rows | Sort-Object SortKey, FirstPort)
 }
 
 if ($Smoke) {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $rows = Get-Scan
+    $rows = @(& $ScanScript)
     $sw.Stop()
     $rows | Format-Table App, Ports, Process, Kind, Uptime, Mem, Folder -AutoSize | Out-String -Width 220 | Write-Output
     Write-Output ("{0} rows in {1:n1}s" -f $rows.Count, $sw.Elapsed.TotalSeconds)
@@ -294,29 +352,82 @@ $chkSystem = $window.FindName('ChkSystem')
 
 $script:allRows = @()
 $script:lastScan = [datetime]::MinValue
+$script:scanSecs = 0.0
+$script:scanning = $false
+$script:rescanQueued = $false
+$script:pending = [System.Collections.ArrayList]::new()
 
-function Update-View([bool]$rescan) {
-    if ($rescan) {
-        $status.Text = 'Scanning...'
-        $window.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Render)
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        try { $script:allRows = Get-Scan } catch { $status.Text = "Scan failed: $_"; return }
-        $sw.Stop()
-        $script:lastScan = Get-Date
-        $script:scanSecs = $sw.Elapsed.TotalSeconds
+# One dispatcher timer polls background runspaces for completion, so all
+# results are handled back on the UI thread and the window never blocks.
+$script:timer = New-Object Windows.Threading.DispatcherTimer
+$script:timer.Interval = [TimeSpan]::FromMilliseconds(120)
+$script:timer.Add_Tick({
+    for ($i = $script:pending.Count - 1; $i -ge 0; $i--) {
+        $j = $script:pending[$i]
+        if (-not $j.Handle.IsCompleted) { continue }
+        $script:pending.RemoveAt($i)
+        $result = $null; $err = $null
+        try { $result = $j.PS.EndInvoke($j.Handle) } catch { $err = "$_" }
+        $j.PS.Dispose()
+        & $j.OnDone $result $err
     }
+    if ($script:pending.Count -eq 0) { $script:timer.Stop() }
+})
+
+function Start-Background([string]$scriptText, [scriptblock]$onDone, $runspace) {
+    $ps = [powershell]::Create()
+    if ($runspace) { $ps.Runspace = $runspace }
+    [void]$ps.AddScript($scriptText)
+    [void]$script:pending.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); OnDone = $onDone })
+    $script:timer.Start()
+}
+
+# Scans are serialized (see $script:scanning), so they share one persistent
+# runspace - CIM/cmdlet imports are paid once, not on every refresh.
+$script:scanRunspace = [runspacefactory]::CreateRunspace()
+$script:scanRunspace.Open()
+
+function Start-Scan {
+    if ($script:scanning) { $script:rescanQueued = $true; return }
+    $script:scanning = $true
+    $script:scanStart = Get-Date
+    $status.Text = 'Scanning...'
+    Start-Background $ScanScript.ToString() -runspace $script:scanRunspace -onDone {
+        param($result, $err)
+        $script:scanning = $false
+        if ($err) { $status.Text = "Scan failed: $err" }
+        else {
+            $script:scanSecs = ((Get-Date) - $script:scanStart).TotalSeconds
+            $script:lastScan = Get-Date
+            try { $script:allRows = [PortApp[]]@($result) } catch { $script:allRows = @($result) }
+            Update-View
+        }
+        if ($script:rescanQueued) { $script:rescanQueued = $false; Start-Scan }
+    }
+}
+
+function Update-View {
     $rows = $script:allRows
     if (-not $chkSystem.IsChecked) { $rows = @($rows | Where-Object { $_.Kind -ne 'system' }) }
     $f = $txtFilter.Text
     if ($f) {
         $rows = @($rows | Where-Object {
-            $_.App -like "*$f*" -or $_.Ports -like "*$f*" -or $_.Process -like "*$f*" -or $_.Folder -like "*$f*"
+            ('' + $_.App).IndexOf($f, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            ('' + $_.Ports).IndexOf($f, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            ('' + $_.Process).IndexOf($f, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            ('' + $_.Folder).IndexOf($f, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
         })
     }
+    $selKey = if ($grid.SelectedItem) { $grid.SelectedItem.Process }
     $grid.ItemsSource = $rows
+    if ($selKey) {
+        foreach ($r in $rows) { if ($r.Process -eq $selKey) { $grid.SelectedItem = $r; break } }
+    }
     $portCount = ($rows | ForEach-Object { ($_.Ports -split ',').Count } | Measure-Object -Sum).Sum
-    $status.Text = '{0} apps - {1} ports - scanned {2:HH:mm:ss} ({3:n1}s) - double-click a row to open it in the browser' -f
+    $text = '{0} apps - {1} ports - scanned {2:HH:mm:ss} ({3:n1}s) - double-click a row to open it in the browser' -f
         $rows.Count, [int]$portCount, $script:lastScan, $script:scanSecs
+    if ($script:scanning) { $text = 'Scanning...  ' + $text }
+    $status.Text = $text
 }
 
 function Get-SelectedRow {
@@ -325,9 +436,10 @@ function Get-SelectedRow {
     return $row
 }
 
-$window.FindName('BtnRefresh').Add_Click({ Update-View $true })
-$txtFilter.Add_TextChanged({ Update-View $false })
-$chkSystem.Add_Click({ Update-View $false })
+$window.FindName('BtnRefresh').Add_Click({ Start-Scan })
+$txtFilter.Add_TextChanged({ Update-View })
+$chkSystem.Add_Click({ Update-View })
+$window.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'F5') { Start-Scan } })
 
 $window.FindName('BtnFolder').Add_Click({
     $row = Get-SelectedRow; if (-not $row) { return }
@@ -359,10 +471,10 @@ $window.FindName('BtnStop').Add_Click({
             'Dev Ports', 'YesNo', 'Question')
         if ($ans -ne 'Yes') { return }
         $status.Text = "Stopping container $($row.DockerName)..."
-        $window.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Render)
-        try { & docker stop -t 2 $row.DockerName *> $null } catch { }
-        Start-Sleep -Milliseconds 500
-        Update-View $true
+        Start-Background "& docker stop -t 2 '$($row.DockerName)' 2>&1 | Out-Null" {
+            param($result, $err)
+            Start-Scan
+        }
         return
     }
     if ($row.KillPid -le 4) { $status.Text = 'That is a Windows kernel listener - not killable.'; return }
@@ -376,14 +488,13 @@ $window.FindName('BtnStop').Add_Click({
         [Windows.MessageBox]::Show("taskkill failed:`n$out`n`nTry running Dev Ports as administrator.",
             'Dev Ports', 'OK', 'Error') | Out-Null
     }
-    Start-Sleep -Milliseconds 400
-    Update-View $true
+    Start-Scan
 })
 
 # Refresh automatically when you come back to the window
 $window.Add_Activated({
-    if (((Get-Date) - $script:lastScan).TotalSeconds -gt 5) { Update-View $true }
+    if (-not $script:scanning -and ((Get-Date) - $script:lastScan).TotalSeconds -gt 5) { Start-Scan }
 })
 
-$window.Add_ContentRendered({ Update-View $true })
+$window.Add_ContentRendered({ Start-Scan })
 [void]$window.ShowDialog()

@@ -14,7 +14,8 @@ If you run a lot of dev servers, you know the pain: something's holding port 300
 - **Shows uptime and memory** per app so you can spot the runaway process.
 - **One-click actions:** open in browser (or double-click a row), copy the `localhost` URL(s), open the project folder, or **Stop** — which kills the full process tree via `taskkill /T`, or `docker stop` for containers.
 - **Live filter** box across app name, port, process, and folder.
-- **Auto-refreshes** when you switch back to the window.
+- **Auto-refreshes** when you switch back to the window (F5 also works).
+- **Never freezes**: scans run in a background runspace and read the TCP table straight from `iphlpapi` — a full refresh is ~1s and the UI stays responsive throughout.
 
 ## Requirements
 
